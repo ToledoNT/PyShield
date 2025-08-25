@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-PyShield Firewall - Firewall simples baseado em Python com Scapy
+PyShield Firewall - Sistema avançado de proteção baseado em Python
+Versão completa com logs em tempo real e interface responsiva
+(agora os logs SEMPRE são acrescentados no mesmo arquivo - modo append)
 """
 
 import json
@@ -25,69 +27,72 @@ except ImportError:
     print("Erro: Módulo 'scapy' não instalado. Instale com: pip install scapy")
     sys.exit(1)
 
-# ---------------------- CONFIGURAÇÕES ---------------------- #
-RULES_FILE = "rules.json"
-LOG_FILE = "firewall.log"
+# ---------------------- CONFIGURAÇÕES GLOBAIS ---------------------- #
+CONFIG_DIR = os.path.expanduser("~/.pyshield")
+RULES_FILE = os.path.join(CONFIG_DIR, "rules.json")
+LOG_FILE = os.path.join(CONFIG_DIR, "firewall.log")
 UPDATE_INTERVAL = 300  # 5 minutos
-ips_bloqueados_cache = set()  # Evita bloqueios repetidos
-rules_manager = None  # Instância global para evitar recriação
+ips_bloqueados_cache = set()
+rules_manager = None
+running = True
+ver_logs = False
 
-# ---------------------- FUNÇÃO DE LOG ---------------------- #
+# ---------------------- SISTEMA DE LOGS ---------------------- #
+log_lock = threading.Lock()  # bloqueio para escrita em logs
+
 def log_evento(msg, nivel="INFO"):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"{timestamp} - {nivel} - {msg}"
+    """Salva logs em arquivo imediatamente e opcionalmente exibe no console"""
+    global LOG_FILE
     try:
-        if not os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "w", encoding='utf-8') as f:
-                f.write("")  # cria arquivo vazio
-        # Rotacionar log se estiver grande
-        if os.path.getsize(LOG_FILE) > 10*1024*1024:
-            backup = f"{LOG_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
-            os.rename(LOG_FILE, backup)
-            with open(LOG_FILE, "w", encoding='utf-8') as f:
-                f.write("")
-        with open(LOG_FILE, "a", encoding='utf-8') as f:
-            f.write(entry + "\n")
-    except IOError as e:
-        print(colored(f"Erro ao escrever log: {e}", "red"))
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"{timestamp} - {nivel} - {msg}"
+
+        # Escrita thread-safe no arquivo de log
+        with log_lock:
+            with open(LOG_FILE, "a", encoding='utf-8', buffering=1) as f:  # buffering=1 -> linha por linha
+                f.write(entry + "\n")
+
+        # Exibir no console se habilitado
+        if ver_logs:
+            print(colored(entry, "yellow"))
+
+    except Exception as e:
+        print(colored(f"ERRO CRÍTICO no sistema de logs: {e}", "red"), flush=True)
+
 
 # ---------------------- GERENCIAMENTO DE REGRAS ---------------------- #
 class FirewallRules:
     def __init__(self):
+        self.lock = threading.Lock()
         self.rules = self.carregar_regras()
         self.last_update = time.time()
-        self.lock = threading.Lock()
+        log_evento("Gerenciador de regras inicializado", "DEBUG")
 
     def carregar_regras(self):
-        default_rules = {
+        try:
+            if os.path.exists(RULES_FILE):
+                with open(RULES_FILE, "r", encoding='utf-8') as f:
+                    regras = json.load(f)
+                    log_evento(f"Regras carregadas: {len(regras.get('blocked_ips', []))} IPs bloqueados", "DEBUG")
+                    return regras
+        except (json.JSONDecodeError, IOError) as e:
+            log_evento(f"Erro ao carregar regras: {e}. Usando padrão.", "ERROR")
+        return {
             "blocked_ips": [],
             "blocked_ports": [],
             "allowed_ports": [80, 443, 53, 22],
             "whitelist_ips": ["127.0.0.1", "localhost"],
             "protocol_rules": {"TCP": {"action": "allow"}, "UDP": {"action": "allow"}, "ICMP": {"action": "block"}},
-            "log_level": "INFO"
+            "log_level": "INFO",
+            "max_log_size": 10
         }
-        try:
-            if os.path.exists(RULES_FILE):
-                with open(RULES_FILE, "r", encoding='utf-8') as f:
-                    data = f.read().strip()
-                    if data:
-                        loaded = json.loads(data)
-                        for k in default_rules:
-                            if k not in loaded:
-                                loaded[k] = default_rules[k]
-                        return loaded
-        except (json.JSONDecodeError, IOError) as e:
-            print(colored(f"⚠️ Erro ao carregar regras: {e}. Usando padrão.", "yellow"))
-            log_evento(f"Erro ao carregar regras: {e}", "ERROR")
-        return default_rules
 
     def get_rules(self):
         with self.lock:
             if time.time() - self.last_update > UPDATE_INTERVAL:
                 self.rules = self.carregar_regras()
                 self.last_update = time.time()
-                log_evento("Regras recarregadas automaticamente", "INFO")
             return self.rules.copy()
 
     def update_rules(self, new_rules):
@@ -95,199 +100,278 @@ class FirewallRules:
             self.rules = new_rules
             self.last_update = time.time()
             self.salvar_regras(new_rules)
-            log_evento("Regras atualizadas manualmente", "INFO")
 
     def salvar_regras(self, regras):
         try:
             with open(RULES_FILE, "w", encoding='utf-8') as f:
                 json.dump(regras, f, indent=4, ensure_ascii=False)
+            log_evento("Regras salvas com sucesso", "DEBUG")
         except IOError as e:
-            print(colored(f"Erro ao salvar regras: {e}", "red"))
             log_evento(f"Erro ao salvar regras: {e}", "ERROR")
 
-# ---------------------- BLOQUEIO DE IP ---------------------- #
+# ---------------------- INICIALIZAÇÃO DO SISTEMA ---------------------- #
+def inicializar_sistema():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    # Sempre registra um cabeçalho de início de execução SEM apagar o arquivo (append)
+    with open(LOG_FILE, "a", encoding='utf-8') as f:
+        f.write("\n" + "="*80 + "\n")
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Sistema inicializado\n")
+        f.write("="*80 + "\n")
+    # Também registra via função de log (vai em append)
+    log_evento("Novo ciclo de execução iniciado (append)", "INFO")
+
+    # Cria arquivo de regras padrão se não existir
+    if not os.path.exists(RULES_FILE):
+        regras_padrao = {
+            "blocked_ips": [],
+            "blocked_ports": [],
+            "allowed_ports": [80, 443, 53, 22],
+            "whitelist_ips": ["127.0.0.1", "localhost"],
+            "protocol_rules": {"TCP": {"action": "allow"}, "UDP": {"action": "allow"}, "ICMP": {"action": "block"}},
+            "log_level": "INFO",
+            "max_log_size": 10
+        }
+        with open(RULES_FILE, "w", encoding='utf-8') as f:
+            json.dump(regras_padrao, f, indent=4, ensure_ascii=False)
+        log_evento("Arquivo de regras padrão criado", "INFO")
+
+# ---------------------- FUNÇÕES DE BLOQUEIO ---------------------- #
+def executar_iptables(comando):
+    try:
+        subprocess.run(comando, capture_output=True, text=True)
+    except Exception as e:
+        log_evento(f"Erro ao executar iptables: {e}", "ERROR")
+
 def bloquear_ip(ip):
     if ip in ips_bloqueados_cache:
         return
-    try:
-        check_cmd = ["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"]
-        if subprocess.run(check_cmd, capture_output=True, text=True).returncode != 0:
-            subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
+    def worker():
+        result = subprocess.run(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"], capture_output=True)
+        if result.returncode != 0:
+            executar_iptables(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
             log_evento(f"IP {ip} bloqueado", "INFO")
-        else:
-            log_evento(f"IP {ip} já bloqueado", "INFO")
         ips_bloqueados_cache.add(ip)
-    except subprocess.CalledProcessError as e:
-        log_evento(f"Erro ao bloquear IP {ip}: {e}", "ERROR")
-    except FileNotFoundError:
-        log_evento("iptables não encontrado", "ERROR")
+    threading.Thread(target=worker, daemon=True).start()
 
-# ---------------------- ANÁLISE DE PACOTES ---------------------- #
-def analisar_pacote(pacote):
-    regras = rules_manager.get_rules()
-    if not pacote.haslayer(IP):
+def desbloquear_ip(ip):
+    def worker():
+        result = subprocess.run(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"], capture_output=True)
+        if result.returncode == 0:
+            executar_iptables(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
+            log_evento(f"IP {ip} desbloqueado", "INFO")
+        ips_bloqueados_cache.discard(ip)
+    threading.Thread(target=worker, daemon=True).start()
+
+def bloquear_porta(porta):
+    def worker():
+        result = subprocess.run(["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(porta), "-j", "DROP"], capture_output=True)
+        if result.returncode != 0:
+            executar_iptables(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(porta), "-j", "DROP"])
+            log_evento(f"Porta {porta} bloqueada", "INFO")
+    threading.Thread(target=worker, daemon=True).start()
+
+def desbloquear_porta(porta):
+    def worker():
+        result = subprocess.run(["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(porta), "-j", "DROP"], capture_output=True)
+        if result.returncode == 0:
+            executar_iptables(["iptables", "-D", "INPUT", "-p", "tcp", "--dport", str(porta), "-j", "DROP"])
+            log_evento(f"Porta {porta} desbloqueada", "INFO")
+    threading.Thread(target=worker, daemon=True).start()
+
+# ---------------------- CAPTURA DE PACOTES ---------------------- #
+def analisar_pacote(pkt):
+    if not pkt.haslayer(IP):
         return
-    ip_origem = pacote[IP].src
+    regras = rules_manager.get_rules()
+    ip_origem = pkt[IP].src
     if ip_origem in regras.get("whitelist_ips", []):
         return
 
     protocol, port = None, None
-    if pacote.haslayer(TCP):
-        protocol = "TCP"
-        port = pacote[TCP].dport
-    elif pacote.haslayer(UDP):
-        protocol = "UDP"
-        port = pacote[UDP].dport
-    elif pacote.haslayer(ICMP):
+    if pkt.haslayer(TCP):
+        protocol, port = "TCP", pkt[TCP].dport
+    elif pkt.haslayer(UDP):
+        protocol, port = "UDP", pkt[UDP].dport
+    elif pkt.haslayer(ICMP):
         protocol = "ICMP"
 
-    bloquear, msg = False, ""
+    motivo = None
     if ip_origem in regras["blocked_ips"]:
-        bloquear, msg = True, f"Pacote de IP bloqueado: {ip_origem}"
-    elif protocol and protocol in regras["protocol_rules"] and regras["protocol_rules"][protocol]["action"] == "block":
-        bloquear, msg = True, f"Protocolo {protocol} bloqueado de {ip_origem}"
-    elif port and port in regras["blocked_ports"]:
-        bloquear, msg = True, f"Porta {port} bloqueada de {ip_origem}"
-    elif port and regras.get("allowed_ports") and port not in regras["allowed_ports"]:
-        bloquear, msg = True, f"Porta {port} não permitida de {ip_origem}"
+        motivo = f"IP bloqueado: {ip_origem}"
+    elif protocol in regras.get("protocol_rules", {}) and regras["protocol_rules"][protocol]["action"] == "block":
+        motivo = f"Protocolo {protocol} bloqueado de {ip_origem}"
+    elif port in regras.get("blocked_ports", []):
+        motivo = f"Porta {port} bloqueada de {ip_origem}"
+    elif port and port not in regras.get("allowed_ports", []):
+        motivo = f"Porta {port} não permitida de {ip_origem}"
 
-    if bloquear:
+    if motivo:
         bloquear_ip(ip_origem)
-        log_evento(msg, "WARNING")
+        log_evento(f"Bloqueio: {motivo}", "WARNING")
 
-# ---------------------- EXIBIÇÃO DE REGRAS ---------------------- #
-def exibir_regras(regras):
-    print(colored("\n=== REGRAS ATUAIS ===", "yellow"))
-    print(colored("IPs Bloqueados:", "red"), *regras["blocked_ips"], sep="\n - ")
-    print(colored("Portas Bloqueadas:", "red"), *regras["blocked_ports"], sep="\n - ")
-    print(colored("Portas Permitidas:", "green"), *regras["allowed_ports"], sep="\n - ")
-    print(colored("Whitelist de IPs:", "cyan"), *regras["whitelist_ips"], sep="\n - ")
-    print(colored("Regras de Protocolos:", "magenta"))
-    for proto, cfg in regras["protocol_rules"].items():
-        print(f" - {proto}: {cfg['action']}")
-    print(colored(f"Nível de log: {regras.get('log_level', 'INFO')}", "white"))
+
+def captura_continua():
+    while running:
+        try:
+            sniff(prn=analisar_pacote, store=0, filter="ip", timeout=1)
+        except Exception as e:
+            log_evento(f"Erro na captura: {e}", "ERROR")
+            time.sleep(5)
 
 # ---------------------- INTERFACE ADMIN ---------------------- #
-def interface_admin():
-    global rules_manager
-    while True:
-        print("\n" + "="*50)
-        print(colored("🔥 PyShield - Interface de Administração", "cyan"))
-        print("1. Listar regras atuais")
-        print("2. Adicionar IP bloqueado")
-        print("3. Remover IP bloqueado")
-        print("4. Adicionar porta bloqueada")
-        print("5. Remover porta bloqueada")
-        print("6. Recarregar regras")
-        print("7. Visualizar logs em tempo real")
-        print("8. Alterar nível de log")
-        print("9. Sair")
+def input_seguro(prompt):
+    try:
+        val = input(prompt)
+        return val.strip() if val.strip() != "" else None
+    except (KeyboardInterrupt, EOFError):
+        print(colored("\nOperação cancelada", "yellow"))
+        return None
 
-        try:
-            opcao = input("\nEscolha uma opção: ").strip()
-            regras = rules_manager.get_rules()
+def exibir_regras(regras):
+    print(colored("\n=== REGRAS ATUAIS ===", "yellow", attrs=["bold"]))
+    print(colored("IPs Bloqueados:", "red"), *(f" - {ip}" for ip in regras["blocked_ips"]) or [" - Nenhum"])
+    print(colored("Portas Bloqueadas:", "red"), *(f" - {p}" for p in regras["blocked_ports"]) or [" - Nenhuma"])
+    print(colored("Portas Permitidas:", "green"), *(f" - {p}" for p in regras["allowed_ports"]))
+    print(colored("Whitelist de IPs:", "cyan"), *(f" - {ip}" for ip in regras["whitelist_ips"]) or [" - Nenhum"])
+    print(colored("Protocolos:", "magenta"))
+    for proto, cfg in regras["protocol_rules"].items():
+        print(f" - {proto}: {cfg['action']}")
 
-            if opcao == "1":
-                exibir_regras(regras)
-            elif opcao == "2":
-                ip = input("IP para bloquear: ").strip()
-                if ip and ip not in regras["blocked_ips"]:
-                    regras["blocked_ips"].append(ip)
-                    rules_manager.update_rules(regras)
-                    bloquear_ip(ip)
-                    print(colored(f"IP {ip} bloqueado com sucesso!", "green"))
-                else:
-                    print(colored("IP inválido ou já bloqueado!", "red"))
-            elif opcao == "3":
-                ip = input("IP para desbloquear: ").strip()
-                if ip and ip in regras["blocked_ips"]:
-                    regras["blocked_ips"].remove(ip)
-                    rules_manager.update_rules(regras)
-                    ips_bloqueados_cache.discard(ip)
-                    print(colored(f"IP {ip} removido da lista de bloqueio!", "green"))
-                else:
-                    print(colored("IP inválido ou não bloqueado!", "red"))
-            elif opcao == "4":
-                try:
-                    porta = int(input("Porta para bloquear: ").strip())
-                    if porta not in regras["blocked_ports"]:
-                        regras["blocked_ports"].append(porta)
-                        rules_manager.update_rules(regras)
-                        print(colored(f"Porta {porta} bloqueada com sucesso!", "green"))
-                    else:
-                        print(colored("Porta já bloqueada!", "yellow"))
-                except ValueError:
-                    print(colored("Porta inválida!", "red"))
-            elif opcao == "5":
-                try:
-                    porta = int(input("Porta para desbloquear: ").strip())
-                    if porta in regras["blocked_ports"]:
-                        regras["blocked_ports"].remove(porta)
-                        rules_manager.update_rules(regras)
-                        print(colored(f"Porta {porta} removida da lista de bloqueio!", "green"))
-                    else:
-                        print(colored("Porta não estava bloqueada!", "yellow"))
-                except ValueError:
-                    print(colored("Porta inválida!", "red"))
-            elif opcao == "6":
-                rules_manager.rules = rules_manager.carregar_regras()
-                rules_manager.last_update = time.time()
-                print(colored("Regras recarregadas com sucesso!", "green"))
-            elif opcao == "7":
-                exibir_logs_realtime()
-            elif opcao == "8":
-                nivel = input("Nível de log (DEBUG/INFO/WARNING/ERROR): ").strip().upper()
-                if nivel in ["DEBUG", "INFO", "WARNING", "ERROR"]:
-                    regras["log_level"] = nivel
-                    rules_manager.update_rules(regras)
-                    print(colored(f"Nível de log alterado para {nivel}!", "green"))
-                else:
-                    print(colored("Nível de log inválido!", "red"))
-            elif opcao == "9":
-                print(colored("Saindo da interface administrativa...", "yellow"))
-                log_evento("Firewall encerrado pelo usuário", "INFO")
-                break
+def exibir_logs_realtime():
+    global ver_logs
+    ver_logs = True
+    print(colored("\n=== LOGS EM TEMPO REAL (Pressione Enter para voltar) ===", "cyan"))
+
+    try:
+        # Exibir logs existentes primeiro
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                for line in lines[-20:]:  # Mostrar últimas 20 linhas
+                    print(colored(line.strip(), "yellow"))
+
+        # Agora monitorar novos logs
+        last_size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
+
+        while ver_logs:
+            if os.path.exists(LOG_FILE):
+                current_size = os.path.getsize(LOG_FILE)
+                if current_size > last_size:
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        f.seek(last_size)
+                        new_lines = f.readlines()
+                        for line in new_lines:
+                            print(colored(line.strip(), "yellow"))
+                        last_size = f.tell()  # CORREÇÃO: tell() em vez de tel()
+
+            # Verificar se usuário pressionou Enter para sair
+            if os.name == "nt":
+                import msvcrt
+                if msvcrt.kbhit() and msvcrt.getch() == b'\r':
+                    break
             else:
-                print(colored("Opção inválida!", "red"))
+                import select
+                dr, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if dr:
+                    sys.stdin.readline()
+                    break
 
-        except KeyboardInterrupt:
-            print(colored("\nOperação cancelada pelo usuário", "yellow"))
-            log_evento("Operação cancelada pelo usuário", "INFO")
-            break
-        except Exception as e:
-            log_evento(f"Erro na interface admin: {e}", "ERROR")
+            time.sleep(0.5)
 
-# ---------------------- MAIN ---------------------- #
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ver_logs = False
+        print(colored("Voltando ao menu principal...", "green"))
+
+
+def interface_admin():
+    global running, rules_manager
+    while running:
+        print("\n" + "="*50)
+        print(colored("🔥 PyShield - Painel de Controle", "cyan", attrs=["bold"]))
+        print("1. Listar regras\n2. Adicionar IP\n3. Remover IP\n4. Adicionar porta\n5. Remover porta\n6. Adicionar IP whitelist\n7. Remover IP whitelist\n8. Recarregar regras\n9. Ver logs\n0. Sair")
+        opcao = input_seguro("\nEscolha uma opção: ")
+        if opcao is None:
+            continue
+        regras = rules_manager.get_rules()
+
+        if opcao == "1":
+            exibir_regras(regras)
+        elif opcao == "2":
+            ip = input_seguro("IP para bloquear (Enter para voltar): ")
+            if ip and ip not in regras["blocked_ips"]:
+                regras["blocked_ips"].append(ip)
+                rules_manager.update_rules(regras)
+                bloquear_ip(ip)
+                log_evento(f"IP {ip} adicionado à lista de bloqueio via interface", "INFO")
+        elif opcao == "3":
+            ip = input_seguro("IP para desbloquear (Enter para voltar): ")
+            if ip and ip in regras["blocked_ips"]:
+                regras["blocked_ips"].remove(ip)
+                rules_manager.update_rules(regras)
+                desbloquear_ip(ip)
+                log_evento(f"IP {ip} removido da lista de bloqueio via interface", "INFO")
+        elif opcao == "4":
+            porta = input_seguro("Porta para bloquear (Enter para voltar): ")
+            if porta and porta.isdigit() and int(porta) not in regras["blocked_ports"]:
+                regras["blocked_ports"].append(int(porta))
+                rules_manager.update_rules(regras)
+                bloquear_porta(int(porta))
+                log_evento(f"Porta {porta} adicionada à lista de bloqueio via interface", "INFO")
+        elif opcao == "5":
+            porta = input_seguro("Porta para desbloquear (Enter para voltar): ")
+            if porta and porta.isdigit() and int(porta) in regras["blocked_ports"]:
+                regras["blocked_ports"].remove(int(porta))
+                rules_manager.update_rules(regras)
+                desbloquear_porta(int(porta))
+                log_evento(f"Porta {porta} removida da lista de bloqueio via interface", "INFO")
+        elif opcao == "6":
+            ip = input_seguro("IP para adicionar à whitelist (Enter para voltar): ")
+            if ip and ip not in regras["whitelist_ips"]:
+                regras["whitelist_ips"].append(ip)
+                rules_manager.update_rules(regras)
+                log_evento(f"IP {ip} adicionado à whitelist via interface", "INFO")
+        elif opcao == "7":
+            ip = input_seguro("IP para remover da whitelist (Enter para voltar): ")
+            if ip and ip in regras["whitelist_ips"]:
+                regras["whitelist_ips"].remove(ip)
+                rules_manager.update_rules(regras)
+                log_evento(f"IP {ip} removido da whitelist via interface", "INFO")
+        elif opcao == "8":
+            rules_manager = FirewallRules()
+            print(colored("Regras recarregadas com sucesso!", "green"))
+            log_evento("Regras recarregadas manualmente via interface", "INFO")
+        elif opcao == "9":
+            exibir_logs_realtime()
+        elif opcao == "0":
+            log_evento("Firewall encerrado pelo usuário", "INFO")
+            print(colored("Encerrando PyShield Firewall...", "green"))
+            running = False
+        else:
+            print(colored("Opção inválida!", "red"))
+            log_evento(f"Tentativa de opção inválida na interface: {opcao}", "WARNING")
+
+# ---------------------- FUNÇÃO PRINCIPAL ---------------------- #
 def main():
     global rules_manager
-    if os.geteuid() != 0:
-        print(colored("Execute como root! sudo python3 firewall.py", "red"))
+    if hasattr(os, 'geteuid') and os.geteuid() != 0:
+        print(colored("Execute como root para funcionalidades de rede!", "red"))
         sys.exit(1)
 
-    # Criar log vazio se não existir
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.write("")
+    inicializar_sistema()
+    rules_manager = FirewallRules()
 
-    rules_manager = FirewallRules()  # instância global única
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
 
-    def signal_handler(sig, frame):
-        print(colored("\n=== Encerrando PyShield Firewall ===", "yellow"))
-        log_evento("Firewall encerrado via sinal", "INFO")
-        os._exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    print(colored("=== PyShield Firewall Iniciado ===", "cyan"))
-    log_evento("Firewall iniciado", "INFO")
-
-    # Thread de captura de pacotes
-    captura_thread = threading.Thread(target=lambda: sniff(prn=analisar_pacote, store=0, filter="ip"), daemon=True)
-    captura_thread.start()
-
-    # Interface administrativa
+    threading.Thread(target=captura_continua, daemon=True).start()
+    log_evento("🔥 PyShield Firewall inicializado com sucesso!", "INFO")
+    print(colored("🔥 PyShield Firewall inicializado!", "green", attrs=["bold"]))
     interface_admin()
+    log_evento("PyShield Firewall encerrado", "INFO")
+    print(colored("PyShield Firewall encerrado.", "red"))
 
 if __name__ == "__main__":
     main()
