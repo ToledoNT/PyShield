@@ -1,27 +1,28 @@
-PyShield Firewall 🔒
+# PyShield Firewall 🔒
 
 Um firewall simples em Python para proteger sua rede.
-O que ele faz?
 
-    Bloqueia IPs indesejados
+## O que ele faz?
 
-    Filtra portas e protocolos
+- Bloqueia IPs indesejados
+- Filtra portas e protocolos
+- Mostra logs em tempo real
+- Interface fácil de usar
 
-    Mostra logs em tempo real
+## 📦 Instalação Fácil
 
-    Interface fácil de usar
-
-📦 Instalação Fácil
-bash
-
-# Baixe e instale automaticamente
+```bash
+# Baixe o repositório
 git clone https://github.com/ToledoNT/PyShield.git
 cd PyShield
+
+# Dê permissão e execute o instalador
 chmod +x install.sh
 sudo ./install.sh
 
+    O instalador cria rules.json e firewall.log na mesma pasta do script.
+
 🚀 Como usar
-bash
 
 # Execute o firewall
 sudo ./firewall.py
@@ -29,39 +30,42 @@ sudo ./firewall.py
 🎮 Menu Principal
 
 Digite um número para escolher:
-text
 
 1 - Ver regras atuais
-2 - Bloquear um IP
-3 - Desbloquear um IP  
+2 - Adicionar IP à lista de bloqueio
+3 - Remover IP da lista de bloqueio
 4 - Bloquear uma porta
 5 - Desbloquear uma porta
-6 - Recarregar regras
-7 - Ver logs ao vivo
-8 - Mudar nível de logs
-9 - Sair
+6 - Adicionar IP à whitelist
+7 - Remover IP da whitelist
+8 - Recarregar regras
+9 - Ver logs em tempo real
+0 - Sair
 
 ⚠️ Importante
 
-    Precisa executar como sudo
+    Precisa executar como sudo.
 
-    Funciona apenas no Linux
+    Funciona apenas no Linux.
 
-    Faz backup das suas regras antes de instalar
+    Recomenda-se fazer backup das suas regras antes de instalar.
 
-📊 O que vem por padrão?
+📊 Configuração padrão
 
-✅ Portas permitidas: 80, 443, 53, 22 (web, https, dns, ssh)
-✅ IPs liberados: localhost e 127.0.0.1
-✅ Protocolos: TCP e UDP permitidos, ICMP bloqueado
-🔧 Se precisar de ajuda
+    ✅ Portas permitidas: 80, 443, 53, 22 (web, https, dns, ssh)
 
-Verifique se tem tudo instalado:
-bash
+    ✅ IPs liberados: localhost e 127.0.0.1
+
+    ✅ Protocolos: TCP e UDP permitidos, ICMP bloqueado
+
+🔧 Verificação de dependências
+
+Certifique-se de ter tudo instalado:
 
 python3 --version
 pip3 --version
 sudo iptables --version
+pip install scapy termcolor
 
 📁 Arquivos importantes
 
@@ -73,15 +77,4 @@ sudo iptables --version
 
     install.sh - Instalador automático
 
-❓ Dúvidas comuns
-
-P: Como volto para o menu?
-R: Na tela de logs, pressione ENTER
-
-P: Onde vejo as regras?
-R: Opção 1 no menu
-
-P: Como sair do programa?
-R: Opção 9 ou Ctrl+C
-
-⭐ Fácil de usar - Apenas execute e escolha as opções!
+⭐ Fácil de usar — Apenas execute e escolha as opções!
