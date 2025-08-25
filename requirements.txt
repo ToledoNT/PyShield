@@ -1,0 +1,2 @@
+scapy==2.5.1
+termcolor==2.3.0
