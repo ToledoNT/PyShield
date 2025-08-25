@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 PyShield Firewall - Sistema avançado de proteção baseado em Python
-Versão completa com logs em tempo real e interface responsiva
-(agora os logs SEMPRE são acrescentados no mesmo arquivo - modo append)
+Logs sempre em append, thread-safe, e interface responsiva
 """
 
 import json
@@ -28,38 +27,32 @@ except ImportError:
     sys.exit(1)
 
 # ---------------------- CONFIGURAÇÕES GLOBAIS ---------------------- #
-CONFIG_DIR = os.path.expanduser("~/.pyshield")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # pasta do script
+CONFIG_DIR = SCRIPT_DIR
 RULES_FILE = os.path.join(CONFIG_DIR, "rules.json")
 LOG_FILE = os.path.join(CONFIG_DIR, "firewall.log")
 UPDATE_INTERVAL = 300  # 5 minutos
+
 ips_bloqueados_cache = set()
 rules_manager = None
 running = True
 ver_logs = False
+log_lock = threading.Lock()
 
 # ---------------------- SISTEMA DE LOGS ---------------------- #
-log_lock = threading.Lock()  # bloqueio para escrita em logs
-
 def log_evento(msg, nivel="INFO"):
-    """Salva logs em arquivo imediatamente e opcionalmente exibe no console"""
-    global LOG_FILE
+    """Salva logs em arquivo thread-safe e exibe opcionalmente no console"""
     try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"{timestamp} - {nivel} - {msg}"
-
-        # Escrita thread-safe no arquivo de log
         with log_lock:
-            with open(LOG_FILE, "a", encoding='utf-8', buffering=1) as f:  # buffering=1 -> linha por linha
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry + "\n")
-
-        # Exibir no console se habilitado
+                f.flush()
         if ver_logs:
             print(colored(entry, "yellow"))
-
     except Exception as e:
         print(colored(f"ERRO CRÍTICO no sistema de logs: {e}", "red"), flush=True)
-
 
 # ---------------------- GERENCIAMENTO DE REGRAS ---------------------- #
 class FirewallRules:
@@ -70,14 +63,14 @@ class FirewallRules:
         log_evento("Gerenciador de regras inicializado", "DEBUG")
 
     def carregar_regras(self):
-        try:
-            if os.path.exists(RULES_FILE):
-                with open(RULES_FILE, "r", encoding='utf-8') as f:
+        if os.path.exists(RULES_FILE):
+            try:
+                with open(RULES_FILE, "r", encoding="utf-8") as f:
                     regras = json.load(f)
                     log_evento(f"Regras carregadas: {len(regras.get('blocked_ips', []))} IPs bloqueados", "DEBUG")
                     return regras
-        except (json.JSONDecodeError, IOError) as e:
-            log_evento(f"Erro ao carregar regras: {e}. Usando padrão.", "ERROR")
+            except (json.JSONDecodeError, IOError) as e:
+                log_evento(f"Erro ao carregar regras: {e}. Usando padrão.", "ERROR")
         return {
             "blocked_ips": [],
             "blocked_ports": [],
@@ -103,7 +96,7 @@ class FirewallRules:
 
     def salvar_regras(self, regras):
         try:
-            with open(RULES_FILE, "w", encoding='utf-8') as f:
+            with open(RULES_FILE, "w", encoding="utf-8") as f:
                 json.dump(regras, f, indent=4, ensure_ascii=False)
             log_evento("Regras salvas com sucesso", "DEBUG")
         except IOError as e:
@@ -112,27 +105,14 @@ class FirewallRules:
 # ---------------------- INICIALIZAÇÃO DO SISTEMA ---------------------- #
 def inicializar_sistema():
     os.makedirs(CONFIG_DIR, exist_ok=True)
-
-    # Sempre registra um cabeçalho de início de execução SEM apagar o arquivo (append)
-    with open(LOG_FILE, "a", encoding='utf-8') as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n" + "="*80 + "\n")
         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Sistema inicializado\n")
         f.write("="*80 + "\n")
-    # Também registra via função de log (vai em append)
     log_evento("Novo ciclo de execução iniciado (append)", "INFO")
-
-    # Cria arquivo de regras padrão se não existir
     if not os.path.exists(RULES_FILE):
-        regras_padrao = {
-            "blocked_ips": [],
-            "blocked_ports": [],
-            "allowed_ports": [80, 443, 53, 22],
-            "whitelist_ips": ["127.0.0.1", "localhost"],
-            "protocol_rules": {"TCP": {"action": "allow"}, "UDP": {"action": "allow"}, "ICMP": {"action": "block"}},
-            "log_level": "INFO",
-            "max_log_size": 10
-        }
-        with open(RULES_FILE, "w", encoding='utf-8') as f:
+        regras_padrao = FirewallRules().carregar_regras()
+        with open(RULES_FILE, "w", encoding="utf-8") as f:
             json.dump(regras_padrao, f, indent=4, ensure_ascii=False)
         log_evento("Arquivo de regras padrão criado", "INFO")
 
@@ -210,7 +190,6 @@ def analisar_pacote(pkt):
         bloquear_ip(ip_origem)
         log_evento(f"Bloqueio: {motivo}", "WARNING")
 
-
 def captura_continua():
     while running:
         try:
@@ -242,16 +221,12 @@ def exibir_logs_realtime():
     global ver_logs
     ver_logs = True
     print(colored("\n=== LOGS EM TEMPO REAL (Pressione Enter para voltar) ===", "cyan"))
-
     try:
-        # Exibir logs existentes primeiro
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                for line in lines[-20:]:  # Mostrar últimas 20 linhas
+                for line in f.readlines()[-20:]:
                     print(colored(line.strip(), "yellow"))
 
-        # Agora monitorar novos logs
         last_size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
 
         while ver_logs:
@@ -260,32 +235,20 @@ def exibir_logs_realtime():
                 if current_size > last_size:
                     with open(LOG_FILE, "r", encoding="utf-8") as f:
                         f.seek(last_size)
-                        new_lines = f.readlines()
-                        for line in new_lines:
+                        for line in f.readlines():
                             print(colored(line.strip(), "yellow"))
-                        last_size = f.tell()  # CORREÇÃO: tell() em vez de tel()
-
-            # Verificar se usuário pressionou Enter para sair
-            if os.name == "nt":
-                import msvcrt
-                if msvcrt.kbhit() and msvcrt.getch() == b'\r':
-                    break
-            else:
-                import select
-                dr, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if dr:
-                    sys.stdin.readline()
-                    break
-
+                        last_size = f.tell()
+            import select
+            dr, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if dr:
+                sys.stdin.readline()
+                break
             time.sleep(0.5)
-
-    except KeyboardInterrupt:
-        pass
     finally:
         ver_logs = False
         print(colored("Voltando ao menu principal...", "green"))
 
-
+# ---------------------- FUNÇÃO PRINCIPAL ---------------------- #
 def interface_admin():
     global running, rules_manager
     while running:
@@ -296,7 +259,6 @@ def interface_admin():
         if opcao is None:
             continue
         regras = rules_manager.get_rules()
-
         if opcao == "1":
             exibir_regras(regras)
         elif opcao == "2":
@@ -353,7 +315,7 @@ def interface_admin():
             print(colored("Opção inválida!", "red"))
             log_evento(f"Tentativa de opção inválida na interface: {opcao}", "WARNING")
 
-# ---------------------- FUNÇÃO PRINCIPAL ---------------------- #
+# ---------------------- MAIN ---------------------- #
 def main():
     global rules_manager
     if hasattr(os, 'geteuid') and os.geteuid() != 0:
